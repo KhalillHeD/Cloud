@@ -1,0 +1,10 @@
+# Optional: AWS mock in a container for local mode. `python tasks.py local` can also start
+# moto in-process, so Docker is not required. Point the code at it with
+#   AWS_ENDPOINT_URL=http://localhost:5000  AWS_ACCESS_KEY_ID=test  AWS_SECRET_ACCESS_KEY=test
+services:
+  moto:
+    image: motoserver/moto:5.0.28
+    ports:
+      - "5000:5000"
+    environment:
+      MOTO_PORT: 5000

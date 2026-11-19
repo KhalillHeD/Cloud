@@ -1,0 +1,628 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Real-Time Traffic Analytics & Congestion Prediction on AWS (blocks 1-10, see
+  docs/architecture.md). Built for AWS Academy Learner Lab: no IAM resources, every
+  service uses the existing LabRole.
+
+# Conventions:
+#  - Role: !Ref LabRoleArn on every Function, Firehose, Glue and Scheduler resource.
+#  - Names start with ProjectName; everything is tagged Project=<ProjectName>.
+#  - Table / stream names follow common/traffic_common/store.py (<ProjectName>-<logical>).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: traffic-analytics
+    AllowedPattern: "[a-z0-9-]+"
+  LabRoleArn:
+    Type: String
+    Description: ARN of the pre-existing LabRole (arn:aws:iam::<account>:role/LabRole)
+  NSensors:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 207
+  TickSeconds:
+    Type: Number
+    Default: 300
+    AllowedValues: [300, 60, 30, 20, 15, 10]
+    Description: Real seconds between two replayed 5-minute slices (300 = real time, 10 = demo)
+  ReplayMode:
+    Type: String
+    Default: clock
+    AllowedValues: [clock, cursor]
+  ReplayStart:
+    Type: String
+    Default: "2012-03-05T06:00:00"
+  SyntheticIncidentRate:
+    Type: String
+    Default: "0.002"
+  ProducerState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: DISABLED pauses the replay and the forecasts (nothing streams, nothing bills per tick)
+  SchedulerType:
+    Type: String
+    Default: rule
+    AllowedValues: [rule, scheduler]
+    Description: rule = EventBridge rule (no role needed); scheduler = EventBridge Scheduler with LabRole
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email subscribed to the SNS alert topic (empty = no subscription)
+  GlueDatabaseName:
+    Type: String
+    Default: traffic_analytics
+    AllowedPattern: "[a-z0-9_]+"
+  LlmProvider:
+    Type: String
+    Default: bedrock
+    AllowedValues: [bedrock, anthropic, openai, none]
+  BedrockModelId:
+    Type: String
+    Default: ""
+  LlmApiKeySecretName:
+    Type: String
+    Default: ""
+    Description: Secrets Manager secret holding an Anthropic/OpenAI key (fallback when Bedrock is blocked)
+  UseCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  UseScheduler: !Equals [!Ref SchedulerType, scheduler]
+  UseRule: !Not [!Equals [!Ref SchedulerType, scheduler]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  IsRealTime: !Equals [!Ref TickSeconds, 300]
+  WithCloudFront: !Equals [!Ref UseCloudFront, "true"]
+  WithoutCloudFront: !Not [!Equals [!Ref UseCloudFront, "true"]]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [x86_64]
+    MemorySize: 256
+    Timeout: 60
+    Layers: [!Ref CommonLayer]
+    Tags:
+      Project: !Ref ProjectName
+    Environment:
+      Variables:
+        PROJECT_NAME: !Ref ProjectName
+        N_SENSORS: !Ref NSensors
+        TICK_SECONDS: !Ref TickSeconds
+        REPLAY_MODE: !Ref ReplayMode
+        REPLAY_START: !Ref ReplayStart
+        SYNTHETIC_INCIDENT_RATE: !Ref SyntheticIncidentRate
+        LAKE_BUCKET: !Ref DataLakeBucket
+        ALERT_TOPIC_ARN: !Ref AlertTopic
+        ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+        GLUE_DATABASE: !Ref GlueDatabaseName
+        LLM_PROVIDER: !Ref LlmProvider
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        LLM_API_KEY_SECRET_NAME: !Ref LlmApiKeySecretName
+
+Resources:
+  # ---------------------------------------------------------------- shared code
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${ProjectName}-common"
+      ContentUri: ../common
+      CompatibleRuntimes: [python3.11]
+    Metadata:
+      BuildMethod: python3.11
+
+  # ---------------------------------------------------------------- 6/7 · S3 data lake
+  # raw/ (Firehose), curated/ + features/ (Glue, Parquet), replay/ + meta/ (seed),
+  # models/, ml/, reports/, athena-results/
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-lake-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-athena-results, Status: Enabled, Prefix: athena-results/, ExpirationInDays: 7}
+          - {Id: expire-raw, Status: Enabled, Prefix: raw/, ExpirationInDays: 30}
+          - {Id: expire-errors, Status: Enabled, Prefix: errors/, ExpirationInDays: 7}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+
+  # ---------------------------------------------------------------- 5 · DynamoDB
+  SensorMetaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-sensor_meta"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: sensor_id, AttributeType: S}]
+      KeySchema: [{AttributeName: sensor_id, KeyType: HASH}]
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  TrafficLatestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-traffic_latest"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: sensor_id, AttributeType: S}]
+      KeySchema: [{AttributeName: sensor_id, KeyType: HASH}]
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  TrafficHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-traffic_history"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: sensor_id, AttributeType: S}
+        - {AttributeName: ts, AttributeType: S}
+      KeySchema:
+        - {AttributeName: sensor_id, KeyType: HASH}
+        - {AttributeName: ts, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: by_ts
+          KeySchema:
+            - {AttributeName: ts, KeyType: HASH}
+            - {AttributeName: sensor_id, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: expire_at, Enabled: true}
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  ForecastsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-forecasts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: sensor_id, AttributeType: S}
+        - {AttributeName: target_ts, AttributeType: S}
+      KeySchema:
+        - {AttributeName: sensor_id, KeyType: HASH}
+        - {AttributeName: target_ts, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expire_at, Enabled: true}
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  AppStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-app_state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expire_at, Enabled: true}
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  # ---------------------------------------------------------------- 3 · Kinesis
+  TrafficStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-stream"
+      RetentionPeriodHours: 24
+      StreamModeDetails: {StreamMode: ON_DEMAND}
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  # ---------------------------------------------------------------- 1/2 · producer
+  ProducerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-producer"
+      CodeUri: ../producer
+      Handler: app.handler
+      Role: !Ref LabRoleArn
+      Timeout: 90
+      Description: Block 2 - METR-LA replay producer, publishes 5-minute slices to Kinesis
+
+  ProducerRule:
+    Type: AWS::Events::Rule
+    Condition: UseRule
+    Properties:
+      Name: !Sub "${ProjectName}-producer"
+      ScheduleExpression: !If [IsRealTime, "rate(5 minutes)", "rate(1 minute)"]
+      State: !Ref ProducerState
+      Targets: [{Arn: !GetAtt ProducerFunction.Arn, Id: producer}]
+
+  ProducerRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseRule
+    Properties:
+      FunctionName: !Ref ProducerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProducerRule.Arn
+
+  ProducerSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: UseScheduler
+    Properties:
+      Name: !Sub "${ProjectName}-producer"
+      ScheduleExpression: !If [IsRealTime, "rate(5 minutes)", "rate(1 minute)"]
+      FlexibleTimeWindow: {Mode: "OFF"}
+      State: !Ref ProducerState
+      Target:
+        Arn: !GetAtt ProducerFunction.Arn
+        RoleArn: !Ref LabRoleArn
+
+  # ---------------------------------------------------------------- 4 · congestion processor
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-processor"
+      CodeUri: ../processing
+      Handler: app.handler
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Description: Block 4 - congestion index, levels, travel times, alert events
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt TrafficStream.Arn
+            StartingPosition: LATEST
+            BatchSize: 500
+            MaximumBatchingWindowInSeconds: 2
+            MaximumRetryAttempts: 2
+            BisectBatchOnFunctionError: true
+
+  # ---------------------------------------------------------------- 6 · Firehose -> S3 raw/
+  RawFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${ProjectName}-raw-to-s3"
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt TrafficStream.Arn
+        RoleARN: !Ref LabRoleArn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        RoleARN: !Ref LabRoleArn
+        Prefix: "raw/dt=!{timestamp:yyyy-MM-dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints: {IntervalInSeconds: 60, SizeInMBs: 5}
+        CompressionFormat: UNCOMPRESSED
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  # ---------------------------------------------------------------- 7 · Glue + Athena
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Traffic analytics data lake
+
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-raw-crawler"
+      Role: !Ref LabRoleArn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets: [{Path: !Sub "s3://${DataLakeBucket}/raw/"}]
+      Schedule: {ScheduleExpression: "cron(15 1 * * ? *)"}
+      SchemaChangePolicy: {UpdateBehavior: UPDATE_IN_DATABASE, DeleteBehavior: LOG}
+      Configuration: '{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+      Tags: {Project: !Ref ProjectName}
+
+  CuratedTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: curated_traffic
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2012-03-01,2012-06-30"   # replay dates (all data is in replay time)
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DataLakeBucket}/curated/dt=${!dt}/"
+        PartitionKeys: [{Name: dt, Type: string}]
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/curated/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: {SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe}
+          Columns:
+            - {Name: ts, Type: timestamp}
+            - {Name: sensor_id, Type: string}
+            - {Name: speed_mph, Type: double}
+            - {Name: free_flow_mph, Type: double}
+            - {Name: congestion_index, Type: double}
+            - {Name: level, Type: string}
+            - {Name: travel_time_s, Type: double}
+            - {Name: incident_flag, Type: boolean}
+            - {Name: source, Type: string}
+            - {Name: hour, Type: int}
+            - {Name: dow, Type: int}
+            - {Name: speed_filled, Type: double}
+
+  FeaturesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: features_hourly
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2012-03-01,2012-06-30"   # replay dates (all data is in replay time)
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DataLakeBucket}/features/dt=${!dt}/"
+        PartitionKeys: [{Name: dt, Type: string}]
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucket}/features/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: {SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe}
+          Columns:
+            - {Name: sensor_id, Type: string}
+            - {Name: dow, Type: int}
+            - {Name: hour, Type: int}
+            - {Name: avg_speed_mph, Type: double}
+            - {Name: avg_congestion, Type: double}
+            - {Name: share_congested, Type: double}
+            - {Name: had_incident, Type: int}
+            - {Name: readings, Type: bigint}
+
+  EtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-etl"
+      Role: !Ref LabRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: ../glue/etl_job.py
+      DefaultArguments:
+        "--job-bookmark-option": job-bookmark-enable
+        "--LAKE_BUCKET": !Ref DataLakeBucket
+        "--TempDir": !Sub "s3://${DataLakeBucket}/glue-temp/"
+      Tags: {Project: !Ref ProjectName}
+
+  EtlTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub "${ProjectName}-etl-daily"
+      Type: SCHEDULED
+      Schedule: "cron(30 1 * * ? *)"
+      StartOnCreation: true
+      Actions: [{JobName: !Ref EtlJob}]
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-wg"
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataLakeBucket}/athena-results/"
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  # ---------------------------------------------------------------- 8 · forecasts
+  ForecastFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-forecast"
+      CodeUri: ../ml/inference
+      Handler: app.handler
+      Role: !Ref LabRoleArn
+      MemorySize: 1024
+      Timeout: 90
+      Description: Block 8 - XGBoost forecasts at +15/+30/+60 min written to DynamoDB
+
+  ForecastRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-forecast"
+      ScheduleExpression: !If [IsRealTime, "rate(5 minutes)", "rate(1 minute)"]
+      State: !Ref ProducerState
+      Targets: [{Arn: !GetAtt ForecastFunction.Arn, Id: forecast}]
+
+  ForecastRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForecastFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ForecastRule.Arn
+
+  # ---------------------------------------------------------------- 9 · alerts + agent
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-agent"
+      CodeUri: ../agent
+      Handler: handler.handler
+      Role: !Ref LabRoleArn
+      MemorySize: 1024
+      Timeout: 60
+      Description: Block 9 - Bedrock/LangChain agent (alerts, daily report, chat)
+      Events:
+        CongestionAlerts:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [traffic.analytics]
+              detail-type: [CongestionAlert]
+        DailyReport:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 6 * * ? *)"
+            Input: '{"mode": "daily_report"}'
+        Chat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /agent/chat
+            Method: POST
+
+  # ---------------------------------------------------------------- 10 · API + dashboard
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type]
+      Tags:
+        Project: !Ref ProjectName
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      CodeUri: ../api
+      Handler: app.handler
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Timeout: 15
+      Description: Block 10 - dashboard API
+      Events:
+        Latest: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /latest, Method: GET}}
+        Sensors: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /sensors, Method: GET}}
+        Forecast: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /forecast, Method: GET}}
+        History: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /history, Method: GET}}
+        Alerts: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /alerts, Method: GET}}
+        Model: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /model, Method: GET}}
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-dashboard-${AWS::AccountId}-${AWS::Region}"
+      WebsiteConfiguration: !If [WithoutCloudFront, {IndexDocument: index.html}, !Ref AWS::NoValue]
+      PublicAccessBlockConfiguration: !If
+        - WithCloudFront
+        - {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+        - {BlockPublicAcls: true, BlockPublicPolicy: false, IgnorePublicAcls: true, RestrictPublicBuckets: false}
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  DashboardPublicPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithoutCloudFront
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+
+  DashboardOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: WithCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: WithCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: dashboard
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt DashboardOac.Id
+            S3OriginConfig: {OriginAccessIdentity: ""}
+        DefaultCacheBehavior:
+          TargetOriginId: dashboard
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # Managed-CachingDisabled
+      Tags: [{Key: Project, Value: !Ref ProjectName}]
+
+  DashboardCloudFrontPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithCloudFront
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}"
+
+Outputs:
+  HttpApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  DashboardUrl:
+    Value: !If
+      - WithCloudFront
+      - !Sub "https://${DashboardDistribution.DomainName}"
+      - !GetAtt DashboardBucket.WebsiteURL
+  DashboardBucketName:
+    Value: !Ref DashboardBucket
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  StreamName:
+    Value: !Ref TrafficStream
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+  EtlJobName:
+    Value: !Ref EtlJob
+  RawCrawlerName:
+    Value: !Ref RawCrawler
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+  ProducerFunctionName:
+    Value: !Ref ProducerFunction
+  AgentFunctionName:
+    Value: !Ref AgentFunction

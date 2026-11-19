@@ -1,0 +1,1 @@
+# shared layer: no extra dependencies (boto3 is in the Lambda runtime)

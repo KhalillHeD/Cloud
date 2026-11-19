@@ -1,0 +1,26 @@
+# secrets / local state
+.env
+.access_report.json
+.stack_outputs.json
+.deploy_params.json
+dashboard/config.local.js
+*.pem
+
+# data (downloaded, never committed)
+data/*
+!data/.gitkeep
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# build outputs
+.aws-sam/
+ml/artifacts/
+dashboard/node_modules/
+dashboard/dist/
+*.zip

@@ -1,0 +1,16 @@
+# Data, EDA, training (local machine). The Lambdas do not need these.
+numpy>=1.26
+pandas>=2.2
+h5py>=3.10
+pyarrow>=15
+xgboost>=2.0
+matplotlib>=3.8
+nbformat>=5.9
+nbclient>=0.10
+ipykernel>=6.29
+tzdata
+# agent (local mode / tests)
+langchain-core>=0.3
+langchain-aws>=0.2
+langchain-anthropic>=0.3
+langchain-openai>=0.3

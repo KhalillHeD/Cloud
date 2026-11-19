@@ -1,0 +1,7 @@
+# Local tooling. Per-component runtime deps live next to each component
+# (producer/requirements.txt, ml/requirements.txt, ...) and are added phase by phase.
+boto3>=1.35
+pytest>=8
+ruff>=0.6
+cfn-lint>=1.0       # template validation without the SAM CLI
+moto[server]>=5.0   # local mode: in-process AWS mock (Kinesis, DynamoDB, S3, Firehose, SNS)

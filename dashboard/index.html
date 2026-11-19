@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Real-Time Traffic Analytics</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="style.css">
+  <script src="config.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◎</span>
+    <div>
+      <h1>Real-Time Traffic Analytics</h1>
+      <p class="sub">METR-LA loop detectors replayed live · Los Angeles · AWS</p>
+    </div>
+  </div>
+  <div class="status">
+    <span id="mode-badge" class="badge live">LIVE</span>
+    <span class="clock">Replay time <strong id="as-of">–</strong></span>
+    <span class="muted" id="refresh-note"></span>
+  </div>
+</header>
+
+<main>
+  <section class="left">
+    <div class="card">
+      <div class="card-head"><h2>Timeframe</h2><span class="muted" id="view-label">Now</span></div>
+      <input type="range" id="timeline" min="-12" max="12" step="1" value="0" aria-label="Timeline: past history to forecast">
+      <div class="ticks" id="ticks"></div>
+      <p class="hint">Left of <b>Now</b>: measured history. Right: <span class="fc">forecast</span> (XGBoost, +15 / +30 / +60 min).</p>
+    </div>
+
+    <div class="summary">
+      <div class="card stat">
+        <div class="stat-label">Heavy + severe congestion</div>
+        <div class="stat-value" id="pct">–</div>
+        <div class="muted" id="km-total">of – km monitored</div>
+        <ul class="levels" id="level-list"></ul>
+      </div>
+      <div class="card stat">
+        <div class="stat-label">Incidents <span class="tag synthetic">synthetic</span></div>
+        <div class="stat-value" id="incidents">–</div>
+        <div class="muted">test events injected by the replay</div>
+        <div class="stat-label model-label">Forecast model</div>
+        <div class="muted" id="model-info">–</div>
+      </div>
+    </div>
+
+    <div class="card table-card">
+      <div class="card-head">
+        <h2>Congested roads <span class="muted" id="table-when"></span></h2>
+        <input id="search" type="search" placeholder="Search sensor…" aria-label="Search sensor">
+      </div>
+      <div class="table-wrap">
+        <table id="roads">
+          <thead><tr>
+            <th>Segment</th><th class="num">Length</th><th class="num">Free-flow</th>
+            <th class="num">Expected</th><th class="num">Actual</th><th class="num">Delay</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <label class="muted show-all"><input type="checkbox" id="show-all"> show all segments</label>
+    </div>
+  </section>
+
+  <section class="right">
+    <div class="card map-card">
+      <div id="map" role="region" aria-label="Map of sensors coloured by congestion level"></div>
+      <div class="legend" id="map-legend"></div>
+    </div>
+    <div class="card chart-card">
+      <div class="card-head">
+        <h2>Travel time: <span id="chart-title">select a segment</span></h2>
+        <span class="muted">last 6 h + forecast</span>
+      </div>
+      <div class="chart-box"><canvas id="chart" aria-label="Travel time chart"></canvas></div>
+    </div>
+  </section>
+
+  <section class="bottom">
+    <div class="card alerts-card">
+      <div class="card-head"><h2>Alerts</h2><span class="muted">from the AI agent (also emailed)</span></div>
+      <ul id="alerts"></ul>
+    </div>
+    <div class="card chat-card">
+      <div class="card-head"><h2>Ask the traffic agent</h2><span class="muted" id="chat-provider"></span></div>
+      <div id="chat-log"></div>
+      <form id="chat-form">
+        <input id="chat-input" autocomplete="off" placeholder="Which roads will be congested in 30 minutes, and why?">
+        <button type="submit">Ask</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[project]
+name = "traffic-analytics-aws"
+version = "0.1.0"
+description = "Real-Time Traffic Analytics & Congestion Prediction on AWS"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = [".", "common", "scripts"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 125
+target-version = "py311"
+extend-exclude = [".aws-sam", "data", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# runs inside the SageMaker XGBoost 1.7 container (Python 3.8): no zip(strict=)
+"ml/train_core.py" = ["B905"]
+"ml/features.py" = ["B905"]
+"ml/evaluate.py" = ["B905"]

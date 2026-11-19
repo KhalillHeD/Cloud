@@ -1,0 +1,4 @@
+langchain-core>=0.3,<2
+langchain-aws>=0.2
+langchain-anthropic>=0.3
+langchain-openai>=0.3
